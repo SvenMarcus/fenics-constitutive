@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Protocol
 
 import basix
 import dolfinx as df
 import numpy as np
 import ufl
-from dolfinx.fem.function import Function
+from dolfinx.fem import Function
 from petsc4py import PETSc
 
 from .history import History
@@ -16,16 +16,40 @@ from .maps import SubSpaceMap, build_subspace_map
 from .stress_strain import ufl_mandel_strain
 
 
-class LawContext(Protocol):
+class LawContext(ABC):
     law: IncrSmallStrainModel
     displacement_gradient: DisplacementGradientFunction
     history: History | None
 
+    @abstractmethod
     def update_stress_and_tangent(
         self, solver: IncrSmallStrainProblem
     ) -> tuple[np.ndarray, np.ndarray]: ...
+
+    @abstractmethod
     def map_to_parent(self, solver: IncrSmallStrainProblem) -> None: ...
-    def scatter_displacement_gradient(self) -> None: ...
+
+    def displacement_gradient_array(self) -> np.ndarray:
+        return self.displacement_gradient.displacement_gradient()
+
+    def scatter_displacement_gradient(self) -> None:
+        self.displacement_gradient.scatter()
+
+    def step(self, solver: IncrSmallStrainProblem) -> None:
+        """Perform a full constitutive update for this law context."""
+        solver.incr_disp.evaluate_incremental_gradient(self.displacement_gradient)
+        stress_input, tangent_input = self.update_stress_and_tangent(solver)
+        history_input = self.history.advance() if self.history is not None else None
+        with df.common.Timer("constitutive-law-evaluation"):
+            self.law.evaluate(
+                solver.sim_time.current,
+                solver.sim_time.dt,
+                self.displacement_gradient.displacement_gradient_fn.x.array,
+                stress_input,
+                tangent_input,
+                history_input,
+            )
+        self.map_to_parent(solver)
 
 
 @dataclass
@@ -38,17 +62,11 @@ class SingleLawContext(LawContext):
         self, solver: IncrSmallStrainProblem
     ) -> tuple[np.ndarray, np.ndarray]:
         solver.stress.update_current()
-        return solver.stress_1.x.array, solver.tangent.x.array
+        return solver.stress.current_array(), solver.tangent.x.array
 
     def map_to_parent(self, solver: IncrSmallStrainProblem) -> None:
         # No mapping needed in single law case
         pass
-
-    def displacement_gradient_array(self) -> np.ndarray:
-        return self.displacement_gradient.displacement_gradient()
-
-    def scatter_displacement_gradient(self) -> None:
-        self.displacement_gradient.scatter()
 
 
 @dataclass
@@ -69,12 +87,6 @@ class MultiLawContext(LawContext):
     def map_to_parent(self, solver: IncrSmallStrainProblem) -> None:
         self.submesh_map.map_to_parent(self.stress, solver.stress.current)
         self.submesh_map.map_to_parent(self.tangent, solver.tangent)
-
-    def displacement_gradient_array(self) -> np.ndarray:
-        return self.displacement_gradient.displacement_gradient()
-
-    def scatter_displacement_gradient(self) -> None:
-        self.displacement_gradient.scatter()
 
 
 @dataclass(slots=True)
@@ -116,7 +128,7 @@ class IncrementalDisplacement:
         """Copy the solution vector x into the current displacement and update ghosts."""
         x.copy(self.current.vector)
         self.current.vector.ghostUpdate(
-            addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD
+            addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD
         )
 
     def evaluate_incremental_gradient(
@@ -141,6 +153,9 @@ class IncrementalStress:
     def previous(self) -> df.fem.Function:
         return self._previous
 
+    def current_array(self) -> np.ndarray:
+        return self.current.x.array
+
     def update_previous(self) -> None:
         self._previous.x.array[:] = self._current.x.array
         self._previous.x.scatter_forward()
@@ -151,6 +166,15 @@ class IncrementalStress:
 
     def scatter_current(self) -> None:
         self._current.x.scatter_forward()
+
+
+@dataclass(slots=True)
+class SimulationTime:
+    dt: float
+    current: float = 0
+
+    def advance(self) -> None:
+        self.current += self.dt
 
 
 class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
@@ -229,16 +253,16 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         QT = df.fem.FunctionSpace(mesh, QTe)
 
         self._law_contexts: list[LawContext] = []
-        self._del_t = del_t  # time increment
-        self._time = 0  # global time will be updated in the update method
+        self.sim_time = SimulationTime(dt=del_t)
 
         if len(laws) == 1:
             # Single law case
             law, cells = laws[0]
-            Q_grad_u_subspace = df.fem.FunctionSpace(mesh, Q_grad_u_e)
-            inc_disp_grad_fn = fn_for(Q_grad_u_subspace)
             QT_subspace = df.fem.FunctionSpace(mesh, QTe)
             tangent_fn: df.fem.Function = fn_for(QT_subspace)
+
+            Q_grad_u_subspace = df.fem.FunctionSpace(mesh, Q_grad_u_e)
+            inc_disp_grad_fn = fn_for(Q_grad_u_subspace)
             disp_grad = DisplacementGradientFunction(cells, inc_disp_grad_fn)
             self._law_contexts.append(
                 SingleLawContext(
@@ -299,32 +323,6 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         self.incr_disp = IncrementalDisplacement(u, q_degree)
 
     @property
-    def _history_0(self) -> list[dict[str, Function] | None]:
-        """Return a list of history_0 dicts for all laws (for backward compatibility)."""
-
-        def _history_or_none(law) -> dict[str, Function] | None:
-            return law.history.history_0 if law.history else None
-
-        return [_history_or_none(law) for law in self._law_contexts]
-
-    @property
-    def _history_1(self) -> list[dict[str, Function] | None]:
-        """Return a list of history_1 dicts for all laws (for backward compatibility)."""
-
-        def _history_or_none(law) -> dict[str, Function] | None:
-            return law.history.history_1 if law.history else None
-
-        return [_history_or_none(law) for law in self._law_contexts]
-
-    @property
-    def _del_grad_u(self) -> list[Function]:
-        """Return a list of inc_disp_grad Functions for all laws (for backward compatibility)."""
-        return [
-            law.displacement_gradient.displacement_gradient_fn
-            for law in self._law_contexts
-        ]
-
-    @property
     def a(self) -> df.fem.FormMetaClass:
         """Compiled bilinear form (the Jacobian form)"""
 
@@ -357,21 +355,7 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         self.incr_disp.update_current(x)
 
         for law_ctx in self._law_contexts:
-            self.incr_disp.evaluate_incremental_gradient(law_ctx.displacement_gradient)
-            stress_input, tangent_input = law_ctx.update_stress_and_tangent(self)
-            history_input = (
-                law_ctx.history.advance() if law_ctx.history is not None else None
-            )
-            with df.common.Timer("constitutive-law-evaluation"):
-                law_ctx.law.evaluate(
-                    self._time,
-                    self._del_t,
-                    law_ctx.displacement_gradient.displacement_gradient_fn.x.array,
-                    stress_input,
-                    tangent_input,
-                    history_input,
-                )
-            law_ctx.map_to_parent(self)
+            law_ctx.step(self)
 
         self.stress.scatter_current()
         self.tangent.x.scatter_forward()
@@ -387,8 +371,27 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
             if law.history is not None:
                 law.history.commit()
 
-        # time update
-        self._time += self._del_t
+        self.sim_time.advance()
+
+    # -------------------------------------------------------------------
+    # NOTE: The following properties are used for backward compatibility
+    # -------------------------------------------------------------------
+
+    @property
+    def _time(self) -> float:
+        return self.sim_time.current
+
+    @_time.setter
+    def _time(self, value: float) -> None:
+        self.sim_time.current = value
+
+    @property
+    def _del_t(self) -> float:
+        return self.sim_time.dt
+
+    @_del_t.setter
+    def _del_t(self, value: float) -> None:
+        self.sim_time.dt = value
 
     @property
     def _u(self) -> df.fem.Function:
@@ -405,6 +408,32 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
     @property
     def stress_1(self) -> df.fem.Function:
         return self.stress.current
+
+    @property
+    def _history_0(self) -> list[dict[str, Function] | None]:
+        """Return a list of history_0 dicts for all laws (for backward compatibility)."""
+
+        def _history_or_none(law) -> dict[str, Function] | None:
+            return law.history.history_0 if law.history else None
+
+        return [_history_or_none(law) for law in self._law_contexts]
+
+    @property
+    def _history_1(self) -> list[dict[str, Function] | None]:
+        """Return a list of history_1 dicts for all laws (for backward compatibility)."""
+
+        def _history_or_none(law) -> dict[str, Function] | None:
+            return law.history.history_1 if law.history else None
+
+        return [_history_or_none(law) for law in self._law_contexts]
+
+    @property
+    def _del_grad_u(self) -> list[Function]:
+        """Return a list of inc_disp_grad Functions for all laws (for backward compatibility)."""
+        return [
+            law.displacement_gradient.displacement_gradient_fn
+            for law in self._law_contexts
+        ]
 
 
 def fn_for(space: df.fem.FunctionSpace) -> df.fem.Function:

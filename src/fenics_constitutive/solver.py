@@ -18,25 +18,20 @@ from .stress_strain import ufl_mandel_strain
 
 class LawContext(Protocol):
     law: IncrSmallStrainModel
-    cells: np.ndarray
-    displacement_gradient_fn: df.fem.Function
-    tangent: df.fem.Function
+    displacement_gradient: DisplacementGradientFunction
     history: History | None
 
     def update_stress_and_tangent(
         self, solver: IncrSmallStrainProblem
     ) -> tuple[np.ndarray, np.ndarray]: ...
     def map_to_parent(self, solver: IncrSmallStrainProblem) -> None: ...
-    def displacement_gradient(self) -> np.ndarray: ...
     def scatter_displacement_gradient(self) -> None: ...
 
 
 @dataclass
 class SingleLawContext(LawContext):
     law: IncrSmallStrainModel
-    cells: np.ndarray
-    displacement_gradient_fn: df.fem.Function
-    tangent: df.fem.Function
+    displacement_gradient: DisplacementGradientFunction
     history: History | None = None
 
     def update_stress_and_tangent(
@@ -49,18 +44,17 @@ class SingleLawContext(LawContext):
         # No mapping needed in single law case
         pass
 
-    def displacement_gradient(self) -> np.ndarray:
-        return self.displacement_gradient_fn.x.array.reshape(self.cells.size, -1)
+    def displacement_gradient_array(self) -> np.ndarray:
+        return self.displacement_gradient.displacement_gradient()
 
     def scatter_displacement_gradient(self) -> None:
-        self.displacement_gradient_fn.x.scatter_forward()
+        self.displacement_gradient.scatter()
 
 
 @dataclass
 class MultiLawContext(LawContext):
     law: IncrSmallStrainModel
-    cells: np.ndarray
-    displacement_gradient_fn: df.fem.Function
+    displacement_gradient: DisplacementGradientFunction
     stress: df.fem.Function
     tangent: df.fem.Function
     submesh_map: SubSpaceMap
@@ -76,25 +70,42 @@ class MultiLawContext(LawContext):
         self.submesh_map.map_to_parent(self.stress, solver.stress.current)
         self.submesh_map.map_to_parent(self.tangent, solver.tangent)
 
+    def displacement_gradient_array(self) -> np.ndarray:
+        return self.displacement_gradient.displacement_gradient()
+
+    def scatter_displacement_gradient(self) -> None:
+        self.displacement_gradient.scatter()
+
+
+@dataclass(slots=True)
+class DisplacementGradientFunction:
+    cells: np.ndarray
+    displacement_gradient_fn: df.fem.Function
+
+    def evaluate_expression(self, expression: df.fem.Expression) -> None:
+        expression.eval(self.cells, self.displacement_gradient())
+        self.scatter()
+
     def displacement_gradient(self) -> np.ndarray:
         return self.displacement_gradient_fn.x.array.reshape(self.cells.size, -1)
 
-    def scatter_displacement_gradient(self) -> None:
+    def scatter(self) -> None:
         self.displacement_gradient_fn.x.scatter_forward()
 
 
 @dataclass
 class IncrementalDisplacement:
-    __slots__ = ("_expr", "current", "previous", "q_points", "u")
-
     u: df.fem.Function
-    q_points: Any  # unsure what the type of q_points is
+    q_degree: int
 
     def __post_init__(self) -> None:
+        mesh = self.u.function_space.mesh
+        basix_celltype = getattr(basix.CellType, mesh.topology.cell_type.name)
+        q_points, _ = basix.make_quadrature(basix_celltype, self.q_degree)
         self.current = self.u
         self.previous = self.u.copy()
         self._expr = df.fem.Expression(
-            ufl.nabla_grad(self.current - self.previous), self.q_points
+            ufl.nabla_grad(self.current - self.previous), q_points
         )
 
     def update_previous(self) -> None:
@@ -108,10 +119,11 @@ class IncrementalDisplacement:
             addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD
         )
 
-    def evaluate_incremental_gradient(self, law_ctx: LawContext) -> None:
-        """Evaluate the incremental displacement gradient at the given cells and write to out_array."""
-        self._expr.eval(law_ctx.cells, law_ctx.displacement_gradient())
-        law_ctx.scatter_displacement_gradient()
+    def evaluate_incremental_gradient(
+        self, displacement_gradient: DisplacementGradientFunction
+    ) -> None:
+        """Evaluate the incremental displacement gradient function"""
+        displacement_gradient.evaluate_expression(self._expr)
 
 
 class IncrementalStress:
@@ -227,12 +239,11 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
             inc_disp_grad_fn = fn_for(Q_grad_u_subspace)
             QT_subspace = df.fem.FunctionSpace(mesh, QTe)
             tangent_fn: df.fem.Function = fn_for(QT_subspace)
+            disp_grad = DisplacementGradientFunction(cells, inc_disp_grad_fn)
             self._law_contexts.append(
                 SingleLawContext(
                     law=law,
-                    cells=cells,
-                    displacement_gradient_fn=inc_disp_grad_fn,
-                    tangent=tangent_fn,
+                    displacement_gradient=disp_grad,
                     history=History.try_create(law, mesh, q_degree),
                 )
             )
@@ -250,11 +261,11 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
                 inc_disp_grad_fn = fn_for(Q_grad_u_subspace)
                 QT_subspace = df.fem.FunctionSpace(submesh, QTe)
                 tangent_fn: df.fem.Function = fn_for(QT_subspace)
+                disp_grad = DisplacementGradientFunction(cells, inc_disp_grad_fn)
                 self._law_contexts.append(
                     MultiLawContext(
                         law=law,
-                        cells=cells,
-                        displacement_gradient_fn=inc_disp_grad_fn,
+                        displacement_gradient=disp_grad,
                         stress=stress_fn,
                         tangent=tangent_fn,
                         submesh_map=subspace_map,
@@ -285,10 +296,7 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         self._form_compiler_options = form_compiler_options
         self._jit_options = jit_options
 
-        basix_celltype = getattr(basix.CellType, mesh.topology.cell_type.name)
-        self.q_points, _ = basix.make_quadrature(basix_celltype, q_degree)
-
-        self.incr_disp = IncrementalDisplacement(u, self.q_points)
+        self.incr_disp = IncrementalDisplacement(u, q_degree)
 
     @property
     def _history_0(self) -> list[dict[str, Function] | None]:
@@ -311,7 +319,10 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
     @property
     def _del_grad_u(self) -> list[Function]:
         """Return a list of inc_disp_grad Functions for all laws (for backward compatibility)."""
-        return [law.displacement_gradient_fn for law in self._law_contexts]
+        return [
+            law.displacement_gradient.displacement_gradient_fn
+            for law in self._law_contexts
+        ]
 
     @property
     def a(self) -> df.fem.FormMetaClass:
@@ -346,20 +357,16 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         self.incr_disp.update_current(x)
 
         for law_ctx in self._law_contexts:
-            self.incr_disp.evaluate_incremental_gradient(law_ctx)
+            self.incr_disp.evaluate_incremental_gradient(law_ctx.displacement_gradient)
             stress_input, tangent_input = law_ctx.update_stress_and_tangent(self)
-
             history_input = (
-                law_ctx.history.advance()
-                if law_ctx.history is not None
-                else None
+                law_ctx.history.advance() if law_ctx.history is not None else None
             )
-
             with df.common.Timer("constitutive-law-evaluation"):
                 law_ctx.law.evaluate(
                     self._time,
                     self._del_t,
-                    law_ctx.displacement_gradient_fn.x.array,
+                    law_ctx.displacement_gradient.displacement_gradient_fn.x.array,
                     stress_input,
                     tangent_input,
                     history_input,

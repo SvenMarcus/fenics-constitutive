@@ -14,7 +14,7 @@ from fenics_constitutive.solver._spaces import ElementSpaces
 from fenics_constitutive.stress_strain import ufl_mandel_strain
 from fenics_constitutive.typesafe import fn_for
 
-from ._lawcontext import LawContext
+from ._lawonsubmesh import LawOnSubMesh
 
 
 @dataclass(slots=True)
@@ -23,11 +23,13 @@ class DisplacementGradientFunction:
     displacement_gradient_fn: df.fem.Function
 
     def evaluate_expression(self, expression: df.fem.Expression) -> None:
-        expression.eval(self.cells, self.displacement_gradient())
+        expression.eval(
+            self.cells, self.displacement_gradient().reshape(self.cells.size, -1)
+        )
         self.scatter()
 
     def displacement_gradient(self) -> np.ndarray:
-        return self.displacement_gradient_fn.x.array.reshape(self.cells.size, -1)
+        return self.displacement_gradient_fn.x.array
 
     def scatter(self) -> None:
         self.displacement_gradient_fn.x.scatter_forward()
@@ -155,11 +157,11 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         self.stress = IncrementalStress(element_spaces.stress_vector_space)
         self.tangent = fn_for(element_spaces.stress_tensor_space(mesh))
 
-        self._law_contexts: list[LawContext] = []
+        self._law_on_submeshs: list[LawOnSubMesh] = []
         self.sim_time = SimulationTime(dt=del_t)
 
-        self._law_contexts = [
-            LawContext.create(law, local_cells, element_spaces)
+        self._law_on_submeshs = [
+            LawOnSubMesh.map_to_cells(law, local_cells, element_spaces)
             for law, local_cells in laws
         ]
 
@@ -217,8 +219,8 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         super().form(x)
         self.incr_disp.update_current(x)
 
-        for law_ctx in self._law_contexts:
-            law_ctx.step(self.sim_time, self.incr_disp, self.stress, self.tangent)
+        for law in self._law_on_submeshs:
+            law.evaluate(self.sim_time, self.incr_disp, self.stress, self.tangent)
 
         self.stress.scatter_current()
         self.tangent.x.scatter_forward()
@@ -230,7 +232,7 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         self.incr_disp.update_previous()
         self.stress.update_previous()
 
-        for law in self._law_contexts:
+        for law in self._law_on_submeshs:
             law.commit_history()
 
         self.sim_time.advance()
@@ -278,7 +280,7 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         def _history_or_none(law) -> dict[str, Function] | None:
             return law.history.history_0 if law.history else None
 
-        return [_history_or_none(law) for law in self._law_contexts]
+        return [_history_or_none(law) for law in self._law_on_submeshs]
 
     @property
     def _history_1(self) -> list[dict[str, Function] | None]:
@@ -287,12 +289,12 @@ class IncrSmallStrainProblem(df.fem.petsc.NonlinearProblem):
         def _history_or_none(law) -> dict[str, Function] | None:
             return law.history.history_1 if law.history else None
 
-        return [_history_or_none(law) for law in self._law_contexts]
+        return [_history_or_none(law) for law in self._law_on_submeshs]
 
     @property
     def _del_grad_u(self) -> list[Function]:
         """Return a list of inc_disp_grad Functions for all laws (for backward compatibility)."""
         return [
             law.displacement_gradient.displacement_gradient_fn
-            for law in self._law_contexts
+            for law in self._law_on_submeshs
         ]

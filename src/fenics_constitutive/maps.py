@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 import dolfinx as df
@@ -31,9 +31,6 @@ class IdentityMap:
     This map does not change the values of the functions.
 
     """
-
-    parent: np.ndarray = field(default=np.zeros(0, dtype=np.int32))
-    child: np.ndarray = field(default=np.zeros(0, dtype=np.int32))
 
     def map_to_parent(self, sub: df.fem.Function, parent: df.fem.Function) -> None:
         assert sub.ufl_shape == parent.ufl_shape, "Shapes do not match"

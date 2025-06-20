@@ -27,9 +27,9 @@ def test_subspace_vector_map_vector_equals_tensor_map():
     QV_space = df.fem.FunctionSpace(mesh, QV)
     QT_space = df.fem.FunctionSpace(mesh, QT)
 
-    Q_map, _ = build_subspace_map(cells, Q_space)
-    QV_map, _ = build_subspace_map(cells, QV_space)
-    QT_map, _ = build_subspace_map(cells, QT_space)
+    Q_map, *_ = build_subspace_map(cells, Q_space)
+    QV_map, *_ = build_subspace_map(cells, QV_space)
+    QT_map, *_ = build_subspace_map(cells, QT_space)
 
     assert np.all(Q_map.parent == QV_map.parent)
     assert np.all(Q_map.child == QV_map.child)
@@ -39,9 +39,9 @@ def test_subspace_vector_map_vector_equals_tensor_map():
     for _ in range(10):
         cell_sample = np.random.permutation(cells)[: num_cells // 2]
 
-        Q_map, _ = build_subspace_map(cell_sample, Q_space)
-        QV_map, _ = build_subspace_map(cell_sample, QV_space)
-        QT_map, _ = build_subspace_map(cell_sample, QT_space)
+        Q_map, *_ = build_subspace_map(cell_sample, Q_space)
+        QV_map, *_ = build_subspace_map(cell_sample, QV_space)
+        QT_map, *_ = build_subspace_map(cell_sample, QT_space)
 
         assert np.all(Q_map.parent == QV_map.parent)
         assert np.all(Q_map.child == QV_map.child)
@@ -85,9 +85,7 @@ def test_map_evaluation():
     for _ in range(10):
         cell_sample = np.random.permutation(cells)[: num_cells // 2]
 
-        Q_sub_map, submesh = build_subspace_map(
-            cell_sample, Q_space, return_subspace=False
-        )
+        Q_sub_map, submesh, _ = build_subspace_map(cell_sample, Q_space)
         Q_sub = df.fem.FunctionSpace(submesh, Q)
         QV_sub = df.fem.FunctionSpace(submesh, QV)
         QT_sub = df.fem.FunctionSpace(submesh, QT)
